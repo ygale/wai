@@ -23,6 +23,7 @@ import Network.Wai.Handler.Warp.Buffer
 import Network.Wai.Handler.Warp.Counter
 import qualified Network.Wai.Handler.Warp.Date as D
 import qualified Network.Wai.Handler.Warp.FdCache as F
+import Network.Wai.Handler.Warp.HTTP2
 import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.Recv
 import Network.Wai.Handler.Warp.Request
@@ -121,7 +122,7 @@ runSettingsConnectionMaker :: Settings -> IO (IO Connection, SockAddr) -> Applic
 runSettingsConnectionMaker x y =
     runSettingsConnectionMakerSecure x (go y)
   where
-    go = fmap (first (fmap (, False)))
+    go = fmap (first (fmap (, TCP)))
 
 ----------------------------------------------------------------
 
@@ -129,7 +130,7 @@ runSettingsConnectionMaker x y =
 -- which will return 'Connection'.
 --
 -- Since 2.1.4
-runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Bool), SockAddr) -> Application -> IO ()
+runSettingsConnectionMakerSecure :: Settings -> IO (IO (Connection, Transport), SockAddr) -> Application -> IO ()
 runSettingsConnectionMakerSecure set getConnMaker app = do
     settingsBeforeMainLoop set
     counter <- newCounter
@@ -166,7 +167,7 @@ onE set mreq e = case fromException e of
 --
 -- Our approach is explained in the comments below.
 acceptConnection :: Settings
-                 -> IO (IO (Connection, Bool), SockAddr)
+                 -> IO (IO (Connection, Transport), SockAddr)
                  -> Application
                  -> D.DateCache
                  -> Maybe F.MutableFdCache
@@ -217,7 +218,7 @@ acceptConnection set getConnMaker app dc fc tm counter = do
 -- Fork a new worker thread for this connection maker, and ask for a
 -- function to unmask (i.e., allow async exceptions to be thrown).
 fork :: Settings
-     -> IO (Connection, Bool)
+     -> IO (Connection, Transport)
      -> SockAddr
      -> Application
      -> D.DateCache
@@ -267,17 +268,19 @@ fork set mkConn addr app dc fc tm counter = settingsFork set $ \ unmask ->
 serveConnection :: Connection
                 -> InternalInfo
                 -> SockAddr
-                -> Bool -- ^ is secure?
+                -> Transport
                 -> Settings
                 -> Application
                 -> IO ()
-serveConnection conn ii addr isSecure' settings app = do
+serveConnection conn ii addr transport settings app = do
     istatus <- newIORef False
     src <- mkSource (connSource conn th istatus)
-    recvSendLoop istatus src `E.catch` \e -> do
-        sendErrorResponse istatus e
-        throwIO (e :: SomeException)
-
+    if isHTTP2 transport then
+        http2 conn ii addr transport settings src app
+      else do
+        http1 istatus src `E.catch` \e -> do
+            sendErrorResponse istatus e
+            throwIO (e :: SomeException)
   where
     th = threadHandle ii
 
@@ -292,9 +295,9 @@ serveConnection conn ii addr isSecure' settings app = do
 
     errorResponse e = settingsOnExceptionResponse settings e
 
-    recvSendLoop istatus fromClient = do
-        (req', mremainingRef, idxhdr) <- recvRequest settings conn ii addr fromClient
-        let req = req' { isSecure = isSecure' }
+    http1 istatus src = do
+        (req', mremainingRef, idxhdr) <- recvRequest settings conn ii addr src
+        let req = req' { isSecure = isTransportSecure transport }
         -- Let the application run for as long as it wants
         T.pause th
 
@@ -310,7 +313,7 @@ serveConnection conn ii addr isSecure' settings app = do
             writeIORef istatus False
             keepAlive <- sendResponse
                 (settingsServerName settings)
-                conn ii req idxhdr (readSource fromClient) res
+                conn ii req idxhdr (readSource src) res
             writeIORef keepAliveRef keepAlive
             return ResponseReceived
         keepAlive <- readIORef keepAliveRef
@@ -333,14 +336,14 @@ serveConnection conn ii addr isSecure' settings app = do
                 Nothing -> do
                     flushEntireBody (requestBody req)
                     T.resume th
-                    recvSendLoop istatus fromClient
+                    http1 istatus src
                 Just maxToRead -> do
                     let tryKeepAlive = do
                             -- flush the rest of the request body
                             isComplete <- flushBody (requestBody req) maxToRead
                             when isComplete $ do
                                 T.resume th
-                                recvSendLoop istatus fromClient
+                                http1 istatus src
                     case mremainingRef of
                         Just ref -> do
                             remaining <- readIORef ref

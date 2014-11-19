@@ -99,7 +99,9 @@ defaultTlsSettings = TLSSettings {
 -- taken from stunnel example in tls-extra
 ciphers :: [TLS.Cipher]
 ciphers =
-    [ TLSExtra.cipher_AES128_SHA1
+    [ TLSExtra.cipher_ECDHE_RSA_AES128GCM_SHA256
+    , TLSExtra.cipher_DHE_RSA_AES128GCM_SHA256
+    , TLSExtra.cipher_AES128_SHA1
     , TLSExtra.cipher_AES256_SHA1
     , TLSExtra.cipher_RC4_128_MD5
     , TLSExtra.cipher_RC4_128_SHA1
@@ -173,17 +175,26 @@ runTLSSocket' tlsset@TLSSettings{..} set credential sock app =
         }
       , TLS.serverShared = def {
           TLS.sharedCredentials = TLS.Credentials [credential]
+        }
+      , TLS.serverHooks = def {
+          TLS.onALPNClientSuggest = Just alpn
           }
       }
 
+alpn :: [S.ByteString] -> IO S.ByteString
+alpn xs
+  | "h2-15" `elem` xs = return "h2-15"
+  | "h2-14" `elem` xs = return "h2-14"
+  | otherwise         = return "http/1.1"
+
 ----------------------------------------------------------------
 
-getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Bool), SockAddr)
+getter :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (IO (Connection, Transport), SockAddr)
 getter tlsset@TLSSettings{..} sock params = do
     (s, sa) <- acceptSafe sock
     return (mkConn tlsset s params, sa)
 
-mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Bool)
+mkConn :: TLS.TLSParams params => TLSSettings -> Socket -> params -> IO (Connection, Transport)
 mkConn tlsset s params = do
     firstBS <- safeRecv s 4096
     cachedRef <- I.newIORef firstBS
@@ -194,7 +205,7 @@ mkConn tlsset s params = do
 
 ----------------------------------------------------------------
 
-httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> I.IORef B.ByteString -> params -> IO (Connection, Bool)
+httpOverTls :: TLS.TLSParams params => TLSSettings -> Socket -> I.IORef B.ByteString -> params -> IO (Connection, Transport)
 httpOverTls TLSSettings{..} s cachedRef params = do
     gen <- Crypto.Random.AESCtr.makeSystem
     ctx <- TLS.contextNew backend params gen
@@ -202,7 +213,8 @@ httpOverTls TLSSettings{..} s cachedRef params = do
     TLS.handshake ctx
     readBuf <- allocateBuffer bufferSize
     writeBuf <- allocateBuffer bufferSize
-    return (conn ctx readBuf writeBuf, True)
+    tls <- getTLSinfo ctx
+    return (conn ctx readBuf writeBuf, tls)
   where
     backend = TLS.Backend {
         TLS.backendFlush = return ()
@@ -253,16 +265,36 @@ httpOverTls TLSSettings{..} s cachedRef params = do
                   else
                     return x
 
+getTLSinfo :: TLS.Context -> IO Transport
+getTLSinfo ctx = do
+    proto <- TLS.getNegotiatedProtocol ctx
+    minfo <- TLS.contextGetInformation ctx
+    case minfo of
+        Nothing   -> return TCP
+        Just TLS.Information{..} -> do
+            let (major, minor) = case infoVersion of
+                    TLS.SSL2  -> (2,0)
+                    TLS.SSL3  -> (3,0)
+                    TLS.TLS10 -> (3,1)
+                    TLS.TLS11 -> (3,2)
+                    TLS.TLS12 -> (3,3)
+            return TLS {
+                tlsMajorVersion = major
+              , tlsMinorVersion = minor
+              , tlsNegotiatedProtocol = proto
+              , tlsChiperID = TLS.cipherID infoCipher
+              }
+
 tryIO :: IO a -> IO (Either IOException a)
 tryIO = try
 
 ----------------------------------------------------------------
 
-plainHTTP :: TLSSettings -> Socket -> I.IORef B.ByteString -> IO (Connection, Bool)
+plainHTTP :: TLSSettings -> Socket -> I.IORef B.ByteString -> IO (Connection, Transport)
 plainHTTP TLSSettings{..} s cachedRef = case onInsecure of
     AllowInsecure -> do
         conn' <- socketConnection s
-        return (conn' { connRecv = getNext cachedRef s 4096 }, False)
+        return (conn' { connRecv = getNext cachedRef s 4096 }, TCP)
     DenyInsecure lbs -> do
         sendAll s "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n"
         mapM_ (sendAll s) $ L.toChunks lbs
