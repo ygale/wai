@@ -18,6 +18,8 @@ module Network.Wai.Handler.WarpTLS (
     , defaultTlsSettings
     , tlsSettings
     , tlsSettingsMemory
+    , tlsSettingsChain
+    , tlsSettingsChainMemory
     , OnInsecure (..)
     -- * Runner
     , runTLS
@@ -27,6 +29,9 @@ module Network.Wai.Handler.WarpTLS (
     ) where
 
 import qualified Network.TLS as TLS
+import Data.X509 (CertificateChain(CertificateChain))
+import Data.X509.File (readSignedObject)
+import Data.X509.Memory (readSignedObjectFromMemory)
 import Network.Wai.Handler.Warp
 import Network.Wai (Application)
 import Network.Socket (Socket, sClose, withSocketsDo, SockAddr)
@@ -54,10 +59,16 @@ import System.IO.Error (isEOFError)
 data TLSSettings = TLSSettings {
     certFile :: FilePath
     -- ^ File containing the certificate.
+  , chainFiles :: [FilePath]
+    -- ^ Files containing chain certificates.
   , keyFile :: FilePath
+    -- ^ File containing the key.
   , certMemory :: Maybe S.ByteString
+    -- ^ Bytes representing the certificate file.
+  , chainMemory :: Maybe [S.ByteString]
+    -- ^ Bytes representing chain certificate files.
   , keyMemory :: Maybe S.ByteString
-    -- ^ File containing the key
+    -- ^ Bytes representing the key file.
   , onInsecure :: OnInsecure
     -- ^ Do we allow insecure connections with this server as well? Default
     -- is a simple text response stating that a secure connection is required.
@@ -87,8 +98,10 @@ data TLSSettings = TLSSettings {
 defaultTlsSettings :: TLSSettings
 defaultTlsSettings = TLSSettings {
     certFile = "certificate.pem"
+  , chainFiles = []
   , keyFile = "key.pem"
   , certMemory = Nothing
+  , chainMemory = Nothing
   , keyMemory = Nothing
   , onInsecure = DenyInsecure "This server only accepts secure HTTPS connections."
   , tlsLogging = def
@@ -119,6 +132,7 @@ tlsSettings :: FilePath -- ^ Certificate file
             -> TLSSettings
 tlsSettings cert key = defaultTlsSettings {
     certFile = cert
+  , chainFiles = []
   , keyFile = key
   }
 
@@ -132,6 +146,36 @@ tlsSettingsMemory
     -> TLSSettings
 tlsSettingsMemory cert key = defaultTlsSettings
     { certMemory = Just cert
+    , chainMemory = Just []
+    , keyMemory = Just key
+    }
+
+-- | A smart constructor for 'TLSSettings', with chain certificates.
+--
+-- Since 3.0.2
+tlsSettingsChain
+    :: FilePath -- ^ Certificate file
+    -> [FilePath] -- ^ Chain certificate files
+    -> FilePath -- ^ Key file
+    -> TLSSettings
+tlsSettingsChain cert chains key = defaultTlsSettings {
+    certFile = cert
+  , chainFiles = chains
+  , keyFile = key
+  }
+
+-- | A smart constructor for 'TLSSettings', but uses in-memory representations
+-- of the certificates and key, including chain certificates.
+--
+-- Since 3.0.2
+tlsSettingsChainMemory
+    :: S.ByteString -- ^ Certificate bytes
+    -> [S.ByteString] -- ^ Chain certificate bytes
+    -> S.ByteString -- ^ Key bytes
+    -> TLSSettings
+tlsSettingsChainMemory cert chains key = defaultTlsSettings
+    { certMemory = Just cert
+    , chainMemory = Just chains
     , keyMemory = Just key
     }
 
@@ -153,12 +197,20 @@ runTLS tset set app = withSocketsDo $
 runTLSSocket :: TLSSettings -> Settings -> Socket -> Application -> IO ()
 runTLSSocket tlsset@TLSSettings{..} set sock app = do
     credential <- case (certMemory, keyMemory) of
-        (Nothing, Nothing) -> either error id <$> TLS.credentialLoadX509 certFile keyFile
+        (Nothing, Nothing) ->
+            either error id <$> TLS.credentialLoadX509 certFile keyFile
         (mcert, mkey) -> do
             cert <- maybe (S.readFile certFile) return mcert
             key <- maybe (S.readFile keyFile) return mkey
             either error return $ TLS.credentialLoadX509FromMemory cert key
-    runTLSSocket' tlsset set credential sock app
+    chains <- maybe
+                (mapM readSignedObject chainFiles)
+                (return . map readSignedObjectFromMemory)
+                chainMemory
+    runTLSSocket' tlsset set (addChains chains credential) sock app
+  where
+    addChains chains (CertificateChain cert, key) =
+        (CertificateChain $ concat $ cert : chains, key)
 
 runTLSSocket' :: TLSSettings -> Settings -> TLS.Credential -> Socket -> Application -> IO ()
 runTLSSocket' tlsset@TLSSettings{..} set credential sock app =
